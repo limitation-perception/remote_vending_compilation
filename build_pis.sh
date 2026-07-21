@@ -93,10 +93,17 @@ for PI in "${PIS[@]}"; do
   rm -rf "$REMOTE_COPY"
 
   if [[ -f "$DEST_DIR/$BIN_NAME" && -z "$DIFF_OUT" ]]; then
-    echo "$PI (${ARCH_DIR[$PI]}): board content is byte-for-byte identical to the zip — no point rebuilding."
-    read -r -p "Fetch the existing binary again anyway? [y/N] " ANSWER
+    echo "$PI (${ARCH_DIR[$PI]}): no source changes — compilation will be skipped."
+    read -r -p "Fetch the latest binary from the board anyway? [y/N] " ANSWER
     if [[ "$ANSWER" =~ ^[Yy]$ ]]; then
-      echo "$PI: using the existing binary $DEST_DIR/$BIN_NAME (no rebuild, no SSH/SCP)."
+      archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history"
+      archive_old_binary "$DEST_DIR/${BIN_NAME}_not_stripped" "$DEST_DIR/history"
+      if scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" \
+          && scp "${SSH_OPTS[@]}" "$PI:~/build/${BIN_NAME}_not_stripped" "$DEST_DIR/"; then
+        echo "$PI: fetched the current binary from the board."
+      else
+        echo "$PI: failed to fetch the binary from the board."
+      fi
     else
       echo "$PI: skipping."
     fi
