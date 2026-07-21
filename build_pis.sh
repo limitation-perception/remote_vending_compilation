@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+COLOR_RED=$'\e[31m'
+COLOR_GREEN=$'\e[32m'
+COLOR_YELLOW=$'\e[33m'
+COLOR_PURPLE=$'\e[35m'
+COLOR_RESET=$'\e[0m'
+
 SCRIPT_VERSION="0.0.1"
-echo "build_pis.sh version $SCRIPT_VERSION started"
+echo "${COLOR_PURPLE}build_pis.sh version $SCRIPT_VERSION started${COLOR_RESET}"
 
 DOWNLOADS_DIR="$HOME/Downloads"
 ZIP_KEYWORDS=("bar" "sport")
@@ -57,7 +63,7 @@ if [[ -z "$ZIP_PATH" ]]; then
   done
 
   if [[ ${#MATCHES[@]} -eq 1 ]]; then
-    echo "Found one archive: $(basename "${MATCHES[0]}")"
+    echo "Found one archive: ${COLOR_GREEN}$(basename "${MATCHES[0]}")${COLOR_RESET}"
     read -r -p "Use it? [Y/n] " ANSWER
     if [[ -z "$ANSWER" || "$ANSWER" =~ ^[Yy]$ ]]; then
       ZIP_PATH="${MATCHES[0]}"
@@ -65,7 +71,7 @@ if [[ -z "$ZIP_PATH" ]]; then
   elif [[ ${#MATCHES[@]} -gt 1 ]]; then
     echo "Found multiple archives in $DOWNLOADS_DIR:"
     for i in "${!MATCHES[@]}"; do
-      printf '  %d) %s\n' "$((i + 1))" "$(basename "${MATCHES[$i]}")"
+      printf '  %d) %s%s%s\n' "$((i + 1))" "$COLOR_GREEN" "$(basename "${MATCHES[$i]}")" "$COLOR_RESET"
     done
     echo "  0) enter path manually"
     while true; do
@@ -196,7 +202,7 @@ for PI in "${PIS[@]}"; do
 
   if [[ -f "$DEST_DIR/$BIN_NAME" && -z "$DIFF_OUT" ]]; then
     echo "$PI (${ARCH_DIR[$PI]}): no source changes — compilation will be skipped."
-    read -r -p "Fetch the latest binary from the board anyway? [y/N] " ANSWER
+    read -r -p "${COLOR_YELLOW}Fetch the latest binary from the board anyway? [y/N] ${COLOR_RESET}" ANSWER
     if [[ "$ANSWER" =~ ^[Yy]$ ]]; then
       VERSIONS_MAP="$DEST_DIR/versions.txt"
       OLD_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8)
@@ -245,8 +251,8 @@ for PI in "${TO_BUILD[@]}"; do
         && NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8) \
         && record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER" ; } \
       > "$LOG" 2>&1 \
-      && { echo "STATUS: OK" >> "$LOG"; echo "OK: $PI"; } \
-      || { echo "STATUS: FAIL" >> "$LOG"; echo "FAIL: $PI (see $LOG)"; }
+      && { echo "STATUS: OK" >> "$LOG"; echo "${COLOR_GREEN}OK: $PI${COLOR_RESET}"; } \
+      || { echo "STATUS: FAIL" >> "$LOG"; echo "${COLOR_RED}FAIL: $PI (see $LOG)${COLOR_RESET}"; }
   ) &
 done
 
@@ -297,7 +303,7 @@ for IDX in "${!PIS[@]}"; do
     MARK_CHAR="✔"
     COLOR="32"
     if [[ "$STATUS" == "SKIP" ]]; then
-      NOTE=" (bin exists, skip)"
+      NOTE=" ${COLOR_YELLOW}(bin exists, skip)${COLOR_RESET}"
     else
       NOTE=""
     fi
