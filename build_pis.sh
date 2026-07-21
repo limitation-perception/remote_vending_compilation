@@ -4,8 +4,8 @@ set -uo pipefail
 SCRIPT_VERSION="0.0.1"
 echo "build_pis.sh version $SCRIPT_VERSION started"
 
-ZIP_PATH="$HOME/Downloads/bar_v0.16.zip"
-ZIP_NAME=$(basename "$ZIP_PATH")
+DOWNLOADS_DIR="$HOME/Downloads"
+ZIP_KEYWORDS=("bar" "sport")
 BIN_NAME="bar"
 RESULT_DIR="$HOME/remote_vending_compilation/result_bins"
 CONTROL_DIR="$HOME/.ssh/sockets"
@@ -18,10 +18,78 @@ SSH_OPTS=(
   -o ControlPersist=60
 )
 
-[[ -f "$ZIP_PATH" ]] || { echo "ZIP not found: $ZIP_PATH"; exit 1; }
+# -n redirects ssh's own stdin from /dev/null. None of our remote
+# commands need local stdin — without this, a plain `ssh ... "cmd"`
+# inherits the script's stdin and, when that stdin is a pipe (piped
+# answers, automation) rather than a live terminal, silently consumes
+# bytes meant for a later `read -p` in this script, making prompts see
+# an empty answer. scp doesn't take -n (and doesn't have this problem,
+# since it isn't running an arbitrary remote shell command), so this is
+# a separate array, only ever used for actual `ssh host "command"` calls.
+SSH_CMD_OPTS=(-n "${SSH_OPTS[@]}")
+
 # unzip is now needed locally too (we extract it to diff against the
 # board), not just on the Pi — this machine didn't need it before.
 command -v unzip >/dev/null || { echo "unzip not found locally — needed for the byte-for-byte check against the board."; exit 1; }
+
+# A zip path can be passed as the first argument ("./build_pis.sh
+# /path/to/some.zip") to skip the picker entirely. Otherwise, no zip is
+# hardcoded — scan Downloads for zips whose name matches one of
+# ZIP_KEYWORDS, let you pick by number (or confirm the single match),
+# and always allow typing a path by hand instead.
+ZIP_PATH="${1:-}"
+
+if [[ -z "$ZIP_PATH" ]]; then
+  CANDIDATES=()
+  while IFS= read -r -d '' f; do
+    CANDIDATES+=("$f")
+  done < <(find "$DOWNLOADS_DIR" -maxdepth 1 -iname "*.zip" -print0 2>/dev/null | sort -z)
+
+  MATCHES=()
+  for f in "${CANDIDATES[@]}"; do
+    base=$(basename "$f")
+    for kw in "${ZIP_KEYWORDS[@]}"; do
+      if [[ "${base,,}" == *"${kw,,}"* ]]; then
+        MATCHES+=("$f")
+        break
+      fi
+    done
+  done
+
+  if [[ ${#MATCHES[@]} -eq 1 ]]; then
+    echo "Found one archive: $(basename "${MATCHES[0]}")"
+    read -r -p "Use it? [Y/n] " ANSWER
+    if [[ -z "$ANSWER" || "$ANSWER" =~ ^[Yy]$ ]]; then
+      ZIP_PATH="${MATCHES[0]}"
+    fi
+  elif [[ ${#MATCHES[@]} -gt 1 ]]; then
+    echo "Found multiple archives in $DOWNLOADS_DIR:"
+    for i in "${!MATCHES[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "$(basename "${MATCHES[$i]}")"
+    done
+    echo "  0) enter path manually"
+    while true; do
+      read -r -p "Pick a number: " CHOICE
+      if [[ "$CHOICE" == "0" ]]; then
+        break
+      elif [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#MATCHES[@]} )); then
+        ZIP_PATH="${MATCHES[$((CHOICE - 1))]}"
+        break
+      else
+        echo "Invalid number, try again."
+      fi
+    done
+  else
+    echo "No archives matching keywords (${ZIP_KEYWORDS[*]}) found in $DOWNLOADS_DIR."
+  fi
+
+  if [[ -z "$ZIP_PATH" ]]; then
+    read -r -p "Enter the zip path manually: " ZIP_PATH
+  fi
+fi
+
+[[ -f "$ZIP_PATH" ]] || { echo "ZIP not found: $ZIP_PATH"; exit 1; }
+ZIP_NAME=$(basename "$ZIP_PATH")
 
 mkdir -p "$RESULT_DIR"
 mkdir -p "$CONTROL_DIR"
@@ -111,7 +179,7 @@ for PI in "${PIS[@]}"; do
   # the local zip extraction with plain diff -rq — diff compares actual
   # file content, not size or mtime, so this is the byte-for-byte check.
   REMOTE_COPY=$(mktemp -d)
-  ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/build && tar -cf - -C ~/build ." 2>/dev/null \
+  ssh "${SSH_CMD_OPTS[@]}" "$PI" "mkdir -p ~/build && tar -cf - -C ~/build ." 2>/dev/null \
     | tar -xf - -C "$REMOTE_COPY" 2>/dev/null
 
   # "Only in $REMOTE_COPY: ..." means a file exists on the board but not
@@ -137,7 +205,7 @@ for PI in "${PIS[@]}"; do
         # re-asked from the board's own binary rather than assumed
         # unchanged — cheap, and doesn't rely on nothing else having
         # touched ~/build between runs
-        NEW_VER=$(ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*')
+        NEW_VER=$(ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*')
         [[ -n "$NEW_VER" ]] || NEW_VER="unknown"
         NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8)
         record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER"
@@ -165,10 +233,10 @@ for PI in "${TO_BUILD[@]}"; do
     LOG="$DEST_DIR/build.log"
     VERSIONS_MAP="$DEST_DIR/versions.txt"
 
-    { ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/build" \
+    { ssh "${SSH_CMD_OPTS[@]}" "$PI" "mkdir -p ~/build" \
         && scp "${SSH_OPTS[@]}" "$ZIP_PATH" "$PI:~/build/" \
-        && ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && unzip -o $ZIP_NAME && qmake bar.pro && make clean && make -j2 && echo UNSTRIPPED_SIZE:\$(stat -c%s $BIN_NAME) && strip $BIN_NAME" \
-        && NEW_VER=$( { ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*'; } || true ) \
+        && ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && unzip -o $ZIP_NAME && qmake bar.pro && make clean && make -j2 && echo UNSTRIPPED_SIZE:\$(stat -c%s $BIN_NAME) && strip $BIN_NAME" \
+        && NEW_VER=$( { ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*'; } || true ) \
         && NEW_VER="${NEW_VER:-unknown}" \
         && echo "NEW_VERSION: $NEW_VER" \
         && OLD_SHA=$( { sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8; } || true ) \
@@ -189,7 +257,11 @@ echo "=== BUILD SUMMARY TABLE ==="
 printf "%-3s %-14s %-12s %-10s %-12s %s\n" " " "DIR" "ARCH" "SIZE" "UNSTRIPPED" "SHA256"
 printf '%s\n' "-----------------------------------------------------------------------------"
 
-for PI in "${PIS[@]}"; do
+FAILED_COUNT=0
+FAILED_POS=0
+
+for IDX in "${!PIS[@]}"; do
+  PI="${PIS[$IDX]}"
   DIRNAME="${ARCH_DIR[$PI]}"
   DEST_DIR="$RESULT_DIR/$DIRNAME"
   BIN_PATH="$DEST_DIR/$BIN_NAME"
@@ -214,6 +286,11 @@ for PI in "${PIS[@]}"; do
     else
       STATUS="FAIL"
     fi
+  fi
+
+  if [[ "$STATUS" == "FAIL" ]]; then
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+    FAILED_POS=$((IDX + 1))
   fi
 
   if [[ "$STATUS" != "FAIL" && -f "$BIN_PATH" ]]; then
@@ -278,3 +355,16 @@ for PI in "${PIS[@]}"; do
   ROW="${ROW/$MARK_CHAR/$COLOR_MARK}"
   printf '%s\n' "$ROW"
 done
+
+# Exit code reflects real build failures only (SKIP/OK both count as
+# "fine" — SKIP means nothing needed doing). 0 = all fine, 1/2/... =
+# that Pi's position in PIS crashed alone, 10 = more than one did (with
+# only 2 Pis today that's "both" — kept as ">1" rather than "== all" so
+# a 3rd Pi later doesn't need this rewritten).
+if [[ "$FAILED_COUNT" -eq 0 ]]; then
+  exit 0
+elif [[ "$FAILED_COUNT" -eq 1 ]]; then
+  exit "$FAILED_POS"
+else
+  exit 10
+fi
