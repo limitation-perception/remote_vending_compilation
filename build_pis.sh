@@ -15,7 +15,10 @@ SSH_OPTS=(
   -o ControlPersist=60
 )
 
-[[ -f "$ZIP_PATH" ]] || { echo "ZIP не знайдено: $ZIP_PATH"; exit 1; }
+[[ -f "$ZIP_PATH" ]] || { echo "ZIP not found: $ZIP_PATH"; exit 1; }
+# unzip is now needed locally too (we extract it to diff against the
+# board), not just on the Pi — this machine didn't need it before.
+command -v unzip >/dev/null || { echo "unzip not found locally — needed for the byte-for-byte check against the board."; exit 1; }
 
 mkdir -p "$RESULT_DIR"
 mkdir -p "$CONTROL_DIR"
@@ -26,15 +29,42 @@ PIS=(
   "pi@10.0.0.47"
 )
 
-# архітектура прив'язана до конкретної малинки (залежить від того, яка
-# ОС стоїть на її SD-картці), а не визначається щоразу заново — тож ім'я
-# директорії кодує розрядність+архітектуру, а не IP
+# architecture is tied to the specific Pi (depends on which OS is on its
+# SD card), not re-detected every run — so the directory name encodes
+# bitness+architecture, not the IP
 declare -A ARCH_DIR=(
   ["pi@10.0.0.58"]="x32_armhf"
   ["pi@10.0.0.47"]="x64_arm64"
 )
 
-ZIP_MTIME=$(stat -c%Y "$ZIP_PATH")
+# Archives the current binary into history/ tagged with ITS OWN mtime
+# (when that build was actually produced), before a fresh scp overwrites
+# it. Previously only one past version was kept (${BIN_NAME}.prev,
+# overwritten every time) — now history accumulates without limit: every
+# successful build leaves its own trace in history/ and nothing is lost.
+# A name collision (two versions sharing the same mtime second) is
+# resolved with a counter suffix instead of silently overwriting.
+archive_old_binary() {
+  local f="$1" hist_dir="$2"
+  [[ -f "$f" ]] || return 0
+  mkdir -p "$hist_dir"
+  local base ts dest n=1
+  base=$(basename "$f")
+  ts=$(date -d "@$(stat -c%Y "$f")" +%Y%m%d_%H%M%S)
+  dest="$hist_dir/${base}.${ts}"
+  while [[ -e "$dest" ]]; do
+    dest="$hist_dir/${base}.${ts}_$((n++))"
+  done
+  cp "$f" "$dest"
+}
+
+# Extract the zip locally once — this is the source of truth for the
+# diff. We compare actual file content against what's in ~/build on the
+# board, not the zip's timestamp (it could be touched without content
+# changing, or stay the same while content did change).
+LOCAL_EXTRACT=$(mktemp -d)
+trap 'rm -rf "$LOCAL_EXTRACT"' EXIT
+unzip -q -o "$ZIP_PATH" -d "$LOCAL_EXTRACT"
 
 TO_BUILD=()
 
@@ -42,15 +72,33 @@ for PI in "${PIS[@]}"; do
   DEST_DIR="$RESULT_DIR/${ARCH_DIR[$PI]}"
   mkdir -p "$DEST_DIR"
 
-  LAST_MTIME=$(cat "$DEST_DIR/last_src_mtime" 2>/dev/null || echo 0)
+  # Pull the current contents of ~/build from the board in one stream
+  # (tar over ssh, no rsync) into a fresh temp dir, then diff it against
+  # the local zip extraction with plain diff -rq — diff compares actual
+  # file content, not size or mtime, so this is the byte-for-byte check.
+  REMOTE_COPY=$(mktemp -d)
+  ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/build && tar -cf - -C ~/build ." 2>/dev/null \
+    | tar -xf - -C "$REMOTE_COPY" 2>/dev/null
 
-  if [[ -f "$DEST_DIR/$BIN_NAME" && "$ZIP_MTIME" -le "$LAST_MTIME" ]]; then
-    echo "$PI (${ARCH_DIR[$PI]}): вихідники не змінювались з часу останньої вдалої збірки — компілювати нема сенсу."
-    read -r -p "Отримати вже наявний бінарник ще раз? [y/N] " ANSWER
+  # "Only in $REMOTE_COPY: ..." means a file exists on the board but not
+  # in the zip — that's a leftover build byproduct (Makefile, *.o, the
+  # binary itself), not source. If we counted those as differences, the
+  # "nothing changed" check would never trigger, since these files are
+  # always left behind by the previous build. So those lines are
+  # deliberately filtered out via grep -vF; we only keep "Files ...
+  # differ" (a changed file) and "Only in $LOCAL_EXTRACT: ..." (a new
+  # file not yet on the board) — i.e. real differences coming from the
+  # zip's side.
+  DIFF_OUT=$(diff -rq "$LOCAL_EXTRACT" "$REMOTE_COPY" 2>&1 | grep -vF "Only in $REMOTE_COPY")
+  rm -rf "$REMOTE_COPY"
+
+  if [[ -f "$DEST_DIR/$BIN_NAME" && -z "$DIFF_OUT" ]]; then
+    echo "$PI (${ARCH_DIR[$PI]}): board content is byte-for-byte identical to the zip — no point rebuilding."
+    read -r -p "Fetch the existing binary again anyway? [y/N] " ANSWER
     if [[ "$ANSWER" =~ ^[Yy]$ ]]; then
-      echo "$PI: використовую вже наявний бінарник $DEST_DIR/$BIN_NAME (без перекомпіляції, без SSH/SCP)."
+      echo "$PI: using the existing binary $DEST_DIR/$BIN_NAME (no rebuild, no SSH/SCP)."
     else
-      echo "$PI: пропускаю."
+      echo "$PI: skipping."
     fi
     continue
   fi
@@ -70,13 +118,13 @@ for PI in "${TO_BUILD[@]}"; do
     { ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/build" \
         && scp "${SSH_OPTS[@]}" "$ZIP_PATH" "$PI:~/build/" \
         && ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && unzip -o $ZIP_NAME && qmake bar.pro && make clean && make -j2 && cp $BIN_NAME ${BIN_NAME}_not_stripped && strip $BIN_NAME" \
-        && { [[ -f "$DEST_DIR/$BIN_NAME" ]] && cp "$DEST_DIR/$BIN_NAME" "$DEST_DIR/${BIN_NAME}.prev"; \
-             [[ -f "$DEST_DIR/${BIN_NAME}_not_stripped" ]] && cp "$DEST_DIR/${BIN_NAME}_not_stripped" "$DEST_DIR/${BIN_NAME}_not_stripped.prev"; \
+        && { archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history"; \
+             archive_old_binary "$DEST_DIR/${BIN_NAME}_not_stripped" "$DEST_DIR/history"; \
              true; } \
         && scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" \
         && scp "${SSH_OPTS[@]}" "$PI:~/build/${BIN_NAME}_not_stripped" "$DEST_DIR/" ; } \
       > "$LOG" 2>&1 \
-      && { echo "STATUS: OK" >> "$LOG"; echo "OK: $PI"; echo "$ZIP_MTIME" > "$DEST_DIR/last_src_mtime"; } \
+      && { echo "STATUS: OK" >> "$LOG"; echo "OK: $PI"; } \
       || { echo "STATUS: FAIL" >> "$LOG"; echo "FAIL: $PI (see $LOG)"; }
   ) &
 done
