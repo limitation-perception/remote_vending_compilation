@@ -4,7 +4,7 @@ set -uo pipefail
 ZIP_PATH="$HOME/Downloads/bar_v0.16.zip"
 ZIP_NAME=$(basename "$ZIP_PATH")
 BIN_NAME="bar"
-RESULT_DIR="$HOME/Downloads/result_bins"
+RESULT_DIR="$HOME/remote_vending_compilation/result_bins"
 CONTROL_DIR="$HOME/.ssh/sockets"
 
 SSH_OPTS=(
@@ -37,7 +37,37 @@ declare -A ARCH_DIR=(
   ["pi@10.0.0.47"]="x64_arm64"
 )
 
-# Archives the current binary into history/ tagged with ITS OWN mtime
+# Each $DEST_DIR (one per architecture) keeps its own versions.txt,
+# tying a binary's own sha256 (first 8 hex chars) to the version it was
+# built from — one line per hash, "<hash> <version>". Kept per-arch (not
+# one shared file) since armhf and arm64 binaries never share a hash
+# anyway, and it keeps each board's history self-contained.
+#
+# Looks up the version recorded for a binary's hash in the given map
+# file. Falls back to "unknown" if this exact binary was never recorded
+# there (e.g. it predates the map, or was placed there by hand).
+version_for_hash() {
+  local map="$1" hash="$2" line
+  [[ -n "$hash" ]] || { echo "unknown"; return; }
+  line=$(grep "^${hash} " "$map" 2>/dev/null | tail -n1)
+  if [[ -n "$line" ]]; then
+    echo "${line#* }"
+  else
+    echo "unknown"
+  fi
+}
+
+# Records a hash -> version pair in the given map file, the first time
+# that exact hash is seen there; a later build producing byte-identical
+# output won't duplicate the line.
+record_version() {
+  local map="$1" hash="$2" version="$3"
+  touch "$map"
+  grep -q "^${hash} " "$map" 2>/dev/null || echo "$hash $version" >> "$map"
+}
+
+# Archives the current binary into history/ tagged with the version
+# looked up for it (via version_for_hash, see above) and ITS OWN mtime
 # (when that build was actually produced), before a fresh scp overwrites
 # it. Previously only one past version was kept (${BIN_NAME}.prev,
 # overwritten every time) — now history accumulates without limit: every
@@ -45,15 +75,15 @@ declare -A ARCH_DIR=(
 # A name collision (two versions sharing the same mtime second) is
 # resolved with a counter suffix instead of silently overwriting.
 archive_old_binary() {
-  local f="$1" hist_dir="$2"
+  local f="$1" hist_dir="$2" version="$3"
   [[ -f "$f" ]] || return 0
   mkdir -p "$hist_dir"
   local base ts dest n=1
   base=$(basename "$f")
   ts=$(date -d "@$(stat -c%Y "$f")" +%Y%m%d_%H%M%S)
-  dest="$hist_dir/${base}.${ts}"
+  dest="$hist_dir/${base}_${version}__${ts}"
   while [[ -e "$dest" ]]; do
-    dest="$hist_dir/${base}.${ts}_$((n++))"
+    dest="$hist_dir/${base}_${version}__${ts}_$((n++))"
   done
   cp "$f" "$dest"
 }
@@ -67,6 +97,7 @@ trap 'rm -rf "$LOCAL_EXTRACT"' EXIT
 unzip -q -o "$ZIP_PATH" -d "$LOCAL_EXTRACT"
 
 TO_BUILD=()
+SKIPPED=()
 
 for PI in "${PIS[@]}"; do
   DEST_DIR="$RESULT_DIR/${ARCH_DIR[$PI]}"
@@ -96,10 +127,17 @@ for PI in "${PIS[@]}"; do
     echo "$PI (${ARCH_DIR[$PI]}): no source changes — compilation will be skipped."
     read -r -p "Fetch the latest binary from the board anyway? [y/N] " ANSWER
     if [[ "$ANSWER" =~ ^[Yy]$ ]]; then
-      archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history"
-      archive_old_binary "$DEST_DIR/${BIN_NAME}_not_stripped" "$DEST_DIR/history"
-      if scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" \
-          && scp "${SSH_OPTS[@]}" "$PI:~/build/${BIN_NAME}_not_stripped" "$DEST_DIR/"; then
+      VERSIONS_MAP="$DEST_DIR/versions.txt"
+      OLD_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8)
+      archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_for_hash "$VERSIONS_MAP" "$OLD_SHA")"
+      if scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/"; then
+        # re-asked from the board's own binary rather than assumed
+        # unchanged — cheap, and doesn't rely on nothing else having
+        # touched ~/build between runs
+        NEW_VER=$(ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*')
+        [[ -n "$NEW_VER" ]] || NEW_VER="unknown"
+        NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8)
+        record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER"
         echo "$PI: fetched the current binary from the board."
       else
         echo "$PI: failed to fetch the binary from the board."
@@ -107,6 +145,7 @@ for PI in "${PIS[@]}"; do
     else
       echo "$PI: skipping."
     fi
+    SKIPPED+=("$PI")
     continue
   fi
 
@@ -121,15 +160,19 @@ for PI in "${TO_BUILD[@]}"; do
     mkdir -p "$DEST_DIR"
 
     LOG="$DEST_DIR/build.log"
+    VERSIONS_MAP="$DEST_DIR/versions.txt"
 
     { ssh "${SSH_OPTS[@]}" "$PI" "mkdir -p ~/build" \
         && scp "${SSH_OPTS[@]}" "$ZIP_PATH" "$PI:~/build/" \
-        && ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && unzip -o $ZIP_NAME && qmake bar.pro && make clean && make -j2 && cp $BIN_NAME ${BIN_NAME}_not_stripped && strip $BIN_NAME" \
-        && { archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history"; \
-             archive_old_binary "$DEST_DIR/${BIN_NAME}_not_stripped" "$DEST_DIR/history"; \
-             true; } \
+        && ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && unzip -o $ZIP_NAME && qmake bar.pro && make clean && make -j2 && echo UNSTRIPPED_SIZE:\$(stat -c%s $BIN_NAME) && strip $BIN_NAME" \
+        && NEW_VER=$( { ssh "${SSH_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*'; } || true ) \
+        && NEW_VER="${NEW_VER:-unknown}" \
+        && echo "NEW_VERSION: $NEW_VER" \
+        && OLD_SHA=$( { sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8; } || true ) \
+        && archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_for_hash "$VERSIONS_MAP" "$OLD_SHA")" \
         && scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" \
-        && scp "${SSH_OPTS[@]}" "$PI:~/build/${BIN_NAME}_not_stripped" "$DEST_DIR/" ; } \
+        && NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8) \
+        && record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER" ; } \
       > "$LOG" 2>&1 \
       && { echo "STATUS: OK" >> "$LOG"; echo "OK: $PI"; } \
       || { echo "STATUS: FAIL" >> "$LOG"; echo "FAIL: $PI (see $LOG)"; }
@@ -148,18 +191,36 @@ for PI in "${PIS[@]}"; do
   DEST_DIR="$RESULT_DIR/$DIRNAME"
   BIN_PATH="$DEST_DIR/$BIN_NAME"
 
-  # the OK/FAIL marker is the last line the build block appended to
-  # its own build.log — no separate status file anymore
-  LAST_LINE=$(tail -n 1 "$DEST_DIR/build.log" 2>/dev/null)
-  if [[ "$LAST_LINE" == "STATUS: OK" ]]; then
-    STATUS="OK"
+  # SKIP is decided up front (this PI never entered TO_BUILD this run) —
+  # only PIs that actually attempted a build fall back to build.log's
+  # last line for OK/FAIL, so a skip never gets read as a stale FAIL/OK
+  # from a previous run's log.
+  IS_SKIPPED=0
+  for S in "${SKIPPED[@]}"; do
+    [[ "$S" == "$PI" ]] && IS_SKIPPED=1 && break
+  done
+
+  if [[ "$IS_SKIPPED" == 1 ]]; then
+    STATUS="SKIP"
   else
-    STATUS="FAIL"
+    # the OK/FAIL marker is the last line the build block appended to
+    # its own build.log — no separate status file anymore
+    LAST_LINE=$(tail -n 1 "$DEST_DIR/build.log" 2>/dev/null)
+    if [[ "$LAST_LINE" == "STATUS: OK" ]]; then
+      STATUS="OK"
+    else
+      STATUS="FAIL"
+    fi
   fi
 
-  if [[ "$STATUS" == "OK" && -f "$BIN_PATH" ]]; then
+  if [[ "$STATUS" != "FAIL" && -f "$BIN_PATH" ]]; then
     MARK_CHAR="✔"
     COLOR="32"
+    if [[ "$STATUS" == "SKIP" ]]; then
+      NOTE=" (bin exists, skip)"
+    else
+      NOTE=""
+    fi
     # byte-exact size via stat+numfmt, not `du -h` — du reports
     # disk-block usage (rounds up to 4K), which is meaningless noise
     # next to a few KB of stripped debug symbols.
@@ -168,9 +229,12 @@ for PI in "${PIS[@]}"; do
     SIZE=$(numfmt --to=iec --suffix=B "$(stat -c%s "$BIN_PATH")")
     SHA=$(sha256sum "$BIN_PATH" | cut -d' ' -f1 | cut -c1-8)
 
-    NOT_STRIPPED_PATH="$DEST_DIR/${BIN_NAME}_not_stripped"
-    if [[ -f "$NOT_STRIPPED_PATH" ]]; then
-      NOT_STRIPPED_SIZE=$(numfmt --to=iec --suffix=B "$(stat -c%s "$NOT_STRIPPED_PATH")")
+    # the unstripped binary is never written to disk (not on the board,
+    # not here) — its size is captured as a stat run remotely right
+    # before `strip`, and lives only as a line in build.log
+    UNSTRIPPED_RAW=$(grep -o 'UNSTRIPPED_SIZE:[0-9]*' "$DEST_DIR/build.log" 2>/dev/null | tail -n1 | cut -d: -f2)
+    if [[ -n "$UNSTRIPPED_RAW" ]]; then
+      NOT_STRIPPED_SIZE=$(numfmt --to=iec --suffix=B "$UNSTRIPPED_RAW")
     else
       NOT_STRIPPED_SIZE="-"
     fi
@@ -200,12 +264,13 @@ for PI in "${PIS[@]}"; do
     SIZE="-"
     NOT_STRIPPED_SIZE="-"
     SHA="(see log: $DEST_DIR/build.log)"
+    NOTE=""
   fi
 
   # pad the row as plain text first, then colorize only the mark —
   # doing it the other way round breaks alignment because printf counts
   # the invisible ANSI escape bytes as part of the column width.
-  printf -v ROW "%-3s %-14s %-12s %-10s %-12s %s" "$MARK_CHAR" "$DIRNAME" "$ARCH" "$SIZE" "$NOT_STRIPPED_SIZE" "$SHA"
+  printf -v ROW "%-3s %-14s %-12s %-10s %-12s %s%s" "$MARK_CHAR" "$DIRNAME" "$ARCH" "$SIZE" "$NOT_STRIPPED_SIZE" "$SHA" "$NOTE"
   COLOR_MARK=$'\e['"$COLOR"'m'"$MARK_CHAR"$'\e[0m'
   ROW="${ROW/$MARK_CHAR/$COLOR_MARK}"
   printf '%s\n' "$ROW"
