@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+SCRIPT_VERSION="0.0.1"
+echo "build_pis.sh version $SCRIPT_VERSION started"
+
 ZIP_PATH="$HOME/Downloads/bar_v0.16.zip"
 ZIP_NAME=$(basename "$ZIP_PATH")
 BIN_NAME="bar"
