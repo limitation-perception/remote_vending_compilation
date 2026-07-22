@@ -114,37 +114,22 @@ declare -A ARCH_DIR=(
   ["pi@10.0.0.47"]="x64_arm64"
 )
 
-# Each $DEST_DIR (one per architecture) keeps its own versions.txt,
-# tying a binary's own sha256 (first 8 hex chars) to the version it was
-# built from — one line per hash, "<hash> <version>". Kept per-arch (not
-# one shared file) since armhf and arm64 binaries never share a hash
-# anyway, and it keeps each board's history self-contained.
-#
-# Looks up the version recorded for a binary's hash in the given map
-# file. Falls back to "unknown" if this exact binary was never recorded
-# there (e.g. it predates the map, or was placed there by hand).
-version_for_hash() {
-  local map="$1" hash="$2" line
-  [[ -n "$hash" ]] || { echo "unknown"; return; }
-  line=$(grep "^${hash} " "$map" 2>/dev/null | tail -n1)
-  if [[ -n "$line" ]]; then
-    echo "${line#* }"
-  else
-    echo "unknown"
-  fi
-}
-
-# Records a hash -> version pair in the given map file, the first time
-# that exact hash is seen there; a later build producing byte-identical
-# output won't duplicate the line.
-record_version() {
-  local map="$1" hash="$2" version="$3"
-  touch "$map"
-  grep -q "^${hash} " "$map" 2>/dev/null || echo "$hash $version" >> "$map"
+# The version is no longer tracked in a side file — it's appended as a
+# plain-text marker directly onto the binary itself, right after strip
+# (see the build loop below): "\n#VERSION:<version>#\n". grep -a reads
+# it back without executing the binary, which matters because these are
+# ARM binaries this (x86_64) machine can't run — and it means the
+# version travels with the file itself instead of a lookup table that
+# can drift out of sync with it. Falls back to "unknown" for binaries
+# that predate this marker or were placed there by hand.
+version_from_binary() {
+  local f="$1" v
+  v=$(grep -a -oP '#VERSION:\K[^#]*' "$f" 2>/dev/null | tail -n1)
+  echo "${v:-unknown}"
 }
 
 # Archives the current binary into history/ tagged with the version
-# looked up for it (via version_for_hash, see above) and ITS OWN mtime
+# read from it (via version_from_binary, see above) and ITS OWN mtime
 # (when that build was actually produced), before a fresh scp overwrites
 # it. Previously only one past version was kept (${BIN_NAME}.prev,
 # overwritten every time) — now history accumulates without limit: every
@@ -204,17 +189,11 @@ for PI in "${PIS[@]}"; do
     echo "$PI (${ARCH_DIR[$PI]}): no source changes — compilation will be skipped."
     read -r -p "${COLOR_YELLOW}Fetch the latest binary from the board anyway? [y/N] ${COLOR_RESET}" ANSWER
     if [[ "$ANSWER" =~ ^[Yy]$ ]]; then
-      VERSIONS_MAP="$DEST_DIR/versions.txt"
-      OLD_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8)
-      archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_for_hash "$VERSIONS_MAP" "$OLD_SHA")"
+      # the board's copy already carries its own #VERSION# marker if it
+      # was ever built through this script (appended right after strip,
+      # see below) — no need to re-run it remotely just to ask
+      archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_from_binary "$DEST_DIR/$BIN_NAME")"
       if scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/"; then
-        # re-asked from the board's own binary rather than assumed
-        # unchanged — cheap, and doesn't rely on nothing else having
-        # touched ~/build between runs
-        NEW_VER=$(ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*')
-        [[ -n "$NEW_VER" ]] || NEW_VER="unknown"
-        NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8)
-        record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER"
         echo "$PI: fetched the current binary from the board."
       else
         echo "$PI: failed to fetch the binary from the board."
@@ -237,7 +216,6 @@ for PI in "${TO_BUILD[@]}"; do
     mkdir -p "$DEST_DIR"
 
     LOG="$DEST_DIR/build.log"
-    VERSIONS_MAP="$DEST_DIR/versions.txt"
 
     { ssh "${SSH_CMD_OPTS[@]}" "$PI" "mkdir -p ~/build" \
         && scp "${SSH_OPTS[@]}" "$ZIP_PATH" "$PI:~/build/" \
@@ -245,11 +223,9 @@ for PI in "${TO_BUILD[@]}"; do
         && NEW_VER=$( { ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && ./$BIN_NAME -v" 2>/dev/null | grep -oP 'version \K[0-9]+(\.[0-9]+)*'; } || true ) \
         && NEW_VER="${NEW_VER:-unknown}" \
         && echo "NEW_VERSION: $NEW_VER" \
-        && OLD_SHA=$( { sha256sum "$DEST_DIR/$BIN_NAME" 2>/dev/null | cut -c1-8; } || true ) \
-        && archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_for_hash "$VERSIONS_MAP" "$OLD_SHA")" \
-        && scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" \
-        && NEW_SHA=$(sha256sum "$DEST_DIR/$BIN_NAME" | cut -c1-8) \
-        && record_version "$VERSIONS_MAP" "$NEW_SHA" "$NEW_VER" ; } \
+        && ssh "${SSH_CMD_OPTS[@]}" "$PI" "cd ~/build && printf '\\n#VERSION:%s#\\n' \"$NEW_VER\" >> $BIN_NAME" \
+        && archive_old_binary "$DEST_DIR/$BIN_NAME" "$DEST_DIR/history" "$(version_from_binary "$DEST_DIR/$BIN_NAME")" \
+        && scp "${SSH_OPTS[@]}" "$PI:~/build/$BIN_NAME" "$DEST_DIR/" ; } \
       > "$LOG" 2>&1 \
       && { echo "STATUS: OK" >> "$LOG"; echo "${COLOR_GREEN}OK: $PI${COLOR_RESET}"; } \
       || { echo "STATUS: FAIL" >> "$LOG"; echo "${COLOR_RED}FAIL: $PI (see $LOG)${COLOR_RESET}"; }
